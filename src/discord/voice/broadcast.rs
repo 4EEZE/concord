@@ -726,198 +726,218 @@ async fn connect_stream_broadcast(
     gateway::send_voice_text(&writer, stream_broadcast_identify_payload(session)).await?;
     logging::debug("stream", "broadcast identify sent");
 
-    let result: Result<VoiceConnectionEnd, BroadcastConnectionFailure> = loop {
-        let frame = tokio::select! {
-            _ = &mut stop_rx => {
-                break Ok(VoiceConnectionEnd::Stop);
-            }
-            _ = gateway_control.heartbeat_timed_out() => {
-                break Ok(VoiceConnectionEnd::Reconnect);
-            }
-            media_result = media_finished_rx.recv(), if child_tasks.has_media() => {
-                match media_result {
-                    Some((generation, result)) => {
-                        let Some(result) = broadcast_media_result_for_generation(
-                            media_generation,
-                            generation,
-                            result,
-                        ) else {
-                            continue;
-                        };
-                        match result {
-                            Ok(()) => break Ok(VoiceConnectionEnd::Stop),
-                            Err(error) => break Err(error),
-                        }
-                    }
-                    None => break Ok(VoiceConnectionEnd::Reconnect),
+    // A `?` in the loop below would return from this function directly and skip
+    // the shutdown that follows it, leaving `GatewayChildTasks::drop` to abort
+    // the media task rather than stop it. An abort skips the cleanup that hands
+    // the prepared capture back to the registry, so the reconnect that follows
+    // finds nothing and deletes the stream instead of resuming it. Holding the
+    // loop in an async block makes every `?` land in `result` like a `break`.
+    let result: Result<VoiceConnectionEnd, BroadcastConnectionFailure> = async {
+        loop {
+            let frame = tokio::select! {
+                _ = &mut stop_rx => {
+                    break Ok(VoiceConnectionEnd::Stop);
                 }
+                _ = gateway_control.heartbeat_timed_out() => {
+                    break Ok(VoiceConnectionEnd::Reconnect);
+                }
+                media_result = media_finished_rx.recv(), if child_tasks.has_media() => {
+                    match media_result {
+                        Some((generation, result)) => {
+                            let Some(result) = broadcast_media_result_for_generation(
+                                media_generation,
+                                generation,
+                                result,
+                            ) else {
+                                continue;
+                            };
+                            match result {
+                                Ok(()) => break Ok(VoiceConnectionEnd::Stop),
+                                Err(error) => break Err(error),
+                            }
+                        }
+                        None => break Ok(VoiceConnectionEnd::Reconnect),
+                    }
+                }
+                frame = reader.next() => frame,
+            };
+            let Some(frame) = frame else {
+                break Ok(VoiceConnectionEnd::Reconnect);
+            };
+            let frame =
+                frame.map_err(|error| format!("broadcast websocket read failed: {error}"))?;
+            match gateway_control.frame_action(&frame).await? {
+                gateway::StreamVoiceGatewayFrameAction::Payload => {}
+                gateway::StreamVoiceGatewayFrameAction::Continue => continue,
+                gateway::StreamVoiceGatewayFrameAction::End(outcome) => break Ok(outcome),
             }
-            frame = reader.next() => frame,
-        };
-        let Some(frame) = frame else {
-            break Ok(VoiceConnectionEnd::Reconnect);
-        };
-        let frame = frame.map_err(|error| format!("broadcast websocket read failed: {error}"))?;
-        match gateway_control.frame_action(&frame).await? {
-            gateway::StreamVoiceGatewayFrameAction::Payload => {}
-            gateway::StreamVoiceGatewayFrameAction::Continue => continue,
-            gateway::StreamVoiceGatewayFrameAction::End(outcome) => break Ok(outcome),
-        }
-        match frame {
-            WsMessage::Text(text) => {
-                let value: Value = serde_json::from_str(&text)
-                    .map_err(|error| format!("broadcast websocket JSON parse failed: {error}"))?;
-                gateway_control.record_sequence(&value).await;
-                let Some(opcode) = gateway::voice_gateway_opcode(&value) else {
-                    logging::debug(
-                        "stream",
-                        "ignored broadcast gateway payload with invalid opcode",
-                    );
-                    continue;
-                };
-                match opcode {
-                    VOICE_OP_READY => {
-                        let ready = gateway::parse_voice_ready_payload(&value)?;
-                        let video = parse_broadcast_video_ssrcs(&value)?;
-                        let mode = gateway::choose_encryption_mode(&ready.modes)?;
-                        let (socket, discovered) =
-                            gateway::discover_voice_udp_address(&ready).await?;
-                        gateway::send_voice_text(
-                            &writer,
-                            stream_broadcast_select_protocol_payload(&discovered, &mode),
-                        )
-                        .await?;
-                        gateway::send_voice_text(
-                            &writer,
-                            stream_broadcast_speaking_payload(ready.ssrc),
-                        )
-                        .await?;
-                        gateway::send_voice_text(
-                            &writer,
-                            stream_broadcast_video_payload(ready.ssrc, video),
-                        )
-                        .await?;
-                        {
-                            let mut dave = dave_state.lock().await;
-                            dave.record_ssrc_user(ready.ssrc, session.current_user_id);
-                            dave.record_ssrc_user(video.video_ssrc, session.current_user_id);
-                            dave.record_ssrc_user(video.rtx_ssrc, session.current_user_id);
-                        }
-                        udp_socket = Some(socket);
-                        ready_audio_ssrc = Some(ready.ssrc);
-                        ready_video = Some(video);
-                    }
-                    VOICE_OP_SESSION_DESCRIPTION => {
-                        let description = gateway::parse_voice_session_description(&value)?;
-                        validate_broadcast_video_codec(&description)?;
-                        dave_state
-                            .lock()
-                            .await
-                            .apply_protocol_version(description.dave_protocol_version)?;
-                        let socket = udp_socket
-                            .as_ref()
-                            .ok_or_else(|| {
-                                "broadcast session description arrived before UDP ready".to_owned()
-                            })?
-                            .clone();
-                        let video = ready_video.ok_or_else(|| {
-                            "broadcast session description arrived before video SSRCs".to_owned()
-                        })?;
-                        let audio_ssrc = ready_audio_ssrc.ok_or_else(|| {
-                            "broadcast session description arrived before audio SSRC".to_owned()
-                        })?;
-                        if current_description.as_ref() == Some(&description) {
-                            continue;
-                        }
-                        let finished = media_finished_tx.clone();
-                        let target = session.request.target.clone();
-                        let dave_for_media = Arc::clone(&dave_state);
-                        let events_for_media = events_tx.clone();
-                        let stream_key = session.request.stream_key.clone();
-                        let connection_id = session.connection_id;
-                        let media_description = description.clone();
-                        let media_status_publisher = status_publisher.clone();
-                        let preview_uploader = stream_preview_uploader.clone();
-                        let captures = broadcast_captures.clone();
-                        let (next_keyframe_interval_tx, keyframe_interval_rx) =
-                            watch::channel(description.keyframe_interval);
-                        media_generation = media_generation.wrapping_add(1).max(1);
-                        let generation = media_generation;
-                        // The previous media task owns the prepared capture until
-                        // its cleanup restores it to the registry.
-                        child_tasks.shutdown_media().await;
-                        let (media_stop_tx, media_stop_rx) = oneshot::channel();
-                        let media_task = tokio::spawn(async move {
-                            let result = run_stream_broadcast_media(
-                                socket,
-                                media_description,
-                                keyframe_interval_rx,
-                                dave_for_media,
-                                target,
-                                audio_ssrc,
-                                video,
-                                events_for_media,
-                                connection_id,
-                                stream_key,
-                                media_status_publisher,
-                                preview_uploader,
-                                captures,
-                                media_stop_rx,
-                            )
-                            .await;
-                            let _ = finished.send((generation, result));
-                        });
-                        child_tasks.install_media_gracefully(media_task, media_stop_tx);
-                        keyframe_interval_tx = Some(next_keyframe_interval_tx);
-                        child_tasks
-                            .replace_udp_ping(tokio::spawn(gateway::run_voice_udp_ping(
-                                Arc::clone(
-                                    udp_socket
-                                        .as_ref()
-                                        .expect("UDP socket exists after readiness check"),
-                                ),
-                            )))
-                            .await;
-                        current_description = Some(description);
-                    }
-                    VOICE_OP_SESSION_UPDATE => {
-                        let Some(description) = current_description.as_mut() else {
-                            break Err(BroadcastConnectionFailure::reconnect(
-                                "broadcast session update arrived before session description",
-                            ));
-                        };
-                        let Some(keyframe_interval_tx) = keyframe_interval_tx.as_ref() else {
-                            break Err(BroadcastConnectionFailure::reconnect(
-                                "broadcast session update arrived before media startup",
-                            ));
-                        };
-                        apply_broadcast_session_update(&value, description, keyframe_interval_tx)?;
+            match frame {
+                WsMessage::Text(text) => {
+                    let value: Value = serde_json::from_str(&text).map_err(|error| {
+                        format!("broadcast websocket JSON parse failed: {error}")
+                    })?;
+                    gateway_control.record_sequence(&value).await;
+                    let Some(opcode) = gateway::voice_gateway_opcode(&value) else {
                         logging::debug(
                             "stream",
-                            format!("broadcast session updated: {description:?}"),
+                            "ignored broadcast gateway payload with invalid opcode",
                         );
-                    }
-                    other => {
-                        if !gateway_control
-                            .handle_json_op(other, &value, &mut child_tasks)
-                            .await?
-                        {
+                        continue;
+                    };
+                    match opcode {
+                        VOICE_OP_READY => {
+                            let ready = gateway::parse_voice_ready_payload(&value)?;
+                            let video = parse_broadcast_video_ssrcs(&value)?;
+                            let mode = gateway::choose_encryption_mode(&ready.modes)?;
+                            let (socket, discovered) =
+                                gateway::discover_voice_udp_address(&ready).await?;
+                            gateway::send_voice_text(
+                                &writer,
+                                stream_broadcast_select_protocol_payload(&discovered, &mode),
+                            )
+                            .await?;
+                            gateway::send_voice_text(
+                                &writer,
+                                stream_broadcast_speaking_payload(ready.ssrc),
+                            )
+                            .await?;
+                            gateway::send_voice_text(
+                                &writer,
+                                stream_broadcast_video_payload(ready.ssrc, video),
+                            )
+                            .await?;
+                            {
+                                let mut dave = dave_state.lock().await;
+                                dave.record_ssrc_user(ready.ssrc, session.current_user_id);
+                                dave.record_ssrc_user(video.video_ssrc, session.current_user_id);
+                                dave.record_ssrc_user(video.rtx_ssrc, session.current_user_id);
+                            }
+                            udp_socket = Some(socket);
+                            ready_audio_ssrc = Some(ready.ssrc);
+                            ready_video = Some(video);
+                        }
+                        VOICE_OP_SESSION_DESCRIPTION => {
+                            let description = gateway::parse_voice_session_description(&value)?;
+                            validate_broadcast_video_codec(&description)?;
+                            dave_state
+                                .lock()
+                                .await
+                                .apply_protocol_version(description.dave_protocol_version)?;
+                            let socket = udp_socket
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    "broadcast session description arrived before UDP ready"
+                                        .to_owned()
+                                })?
+                                .clone();
+                            let video = ready_video.ok_or_else(|| {
+                                "broadcast session description arrived before video SSRCs"
+                                    .to_owned()
+                            })?;
+                            let audio_ssrc = ready_audio_ssrc.ok_or_else(|| {
+                                "broadcast session description arrived before audio SSRC".to_owned()
+                            })?;
+                            if current_description.as_ref() == Some(&description) {
+                                continue;
+                            }
+                            let finished = media_finished_tx.clone();
+                            let target = session.request.target.clone();
+                            let dave_for_media = Arc::clone(&dave_state);
+                            let events_for_media = events_tx.clone();
+                            let stream_key = session.request.stream_key.clone();
+                            let connection_id = session.connection_id;
+                            let media_description = description.clone();
+                            let media_status_publisher = status_publisher.clone();
+                            let preview_uploader = stream_preview_uploader.clone();
+                            let captures = broadcast_captures.clone();
+                            let (next_keyframe_interval_tx, keyframe_interval_rx) =
+                                watch::channel(description.keyframe_interval);
+                            media_generation = media_generation.wrapping_add(1).max(1);
+                            let generation = media_generation;
+                            // The previous media task owns the prepared capture until
+                            // its cleanup restores it to the registry.
+                            child_tasks.shutdown_media().await;
+                            let (media_stop_tx, media_stop_rx) = oneshot::channel();
+                            let media_task = tokio::spawn(async move {
+                                let result = run_stream_broadcast_media(
+                                    socket,
+                                    media_description,
+                                    keyframe_interval_rx,
+                                    dave_for_media,
+                                    target,
+                                    audio_ssrc,
+                                    video,
+                                    events_for_media,
+                                    connection_id,
+                                    stream_key,
+                                    media_status_publisher,
+                                    preview_uploader,
+                                    captures,
+                                    media_stop_rx,
+                                )
+                                .await;
+                                let _ = finished.send((generation, result));
+                            });
+                            child_tasks.install_media_gracefully(media_task, media_stop_tx);
+                            keyframe_interval_tx = Some(next_keyframe_interval_tx);
+                            child_tasks
+                                .replace_udp_ping(tokio::spawn(gateway::run_voice_udp_ping(
+                                    Arc::clone(
+                                        udp_socket
+                                            .as_ref()
+                                            .expect("UDP socket exists after readiness check"),
+                                    ),
+                                )))
+                                .await;
+                            current_description = Some(description);
+                        }
+                        VOICE_OP_SESSION_UPDATE => {
+                            let Some(description) = current_description.as_mut() else {
+                                break Err(BroadcastConnectionFailure::reconnect(
+                                    "broadcast session update arrived before session description",
+                                ));
+                            };
+                            let Some(keyframe_interval_tx) = keyframe_interval_tx.as_ref() else {
+                                break Err(BroadcastConnectionFailure::reconnect(
+                                    "broadcast session update arrived before media startup",
+                                ));
+                            };
+                            apply_broadcast_session_update(
+                                &value,
+                                description,
+                                keyframe_interval_tx,
+                            )?;
                             logging::debug(
                                 "stream",
-                                format!("unhandled broadcast gateway op={other}"),
+                                format!("broadcast session updated: {description:?}"),
                             );
+                        }
+                        other => {
+                            if !gateway_control
+                                .handle_json_op(other, &value, &mut child_tasks)
+                                .await?
+                            {
+                                logging::debug(
+                                    "stream",
+                                    format!("unhandled broadcast gateway op={other}"),
+                                );
+                            }
                         }
                     }
                 }
-            }
-            WsMessage::Binary(payload) => {
-                gateway_control.handle_binary(&payload).await?;
-            }
-            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Close(_) | WsMessage::Frame(_) => {
-                unreachable!("gateway control frames are handled first")
+                WsMessage::Binary(payload) => {
+                    gateway_control.handle_binary(&payload).await?;
+                }
+                WsMessage::Ping(_)
+                | WsMessage::Pong(_)
+                | WsMessage::Close(_)
+                | WsMessage::Frame(_) => {
+                    unreachable!("gateway control frames are handled first")
+                }
             }
         }
-    };
+    }
+    .await;
 
     child_tasks.shutdown().await;
     result
